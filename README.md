@@ -18,7 +18,7 @@ Then (similar to the example already filled in), enter the keywords — the phra
 Example:
 
 {
-	"<trigger phrase>": "<response>",
+	"phrase": "response",
 	"number": "0123456789"
 }
 

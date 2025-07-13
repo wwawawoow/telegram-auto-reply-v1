@@ -1,0 +1,200 @@
+import asyncio
+import threading
+import json
+from telethon import TelegramClient, events
+from telethon.errors import SessionPasswordNeededError
+from telethon.tl.types import Chat, Channel, User
+import tkinter as tk
+from tkinter import messagebox, simpledialog, scrolledtext
+from queue import Queue
+
+client = None
+loop = None
+running = False
+bot_loop_thread = None
+
+root = tk.Tk()
+root.title("Telegram auto reply")
+
+fields = {}
+for i, (label, key) in enumerate([
+    ("Номер телефона (+7...):", "phone"),
+    ("API ID:", "api_id"),
+    ("API Hash:", "api_hash")
+]):
+    tk.Label(root, text=label).grid(row=i, column=0, sticky="e")
+    entry = tk.Entry(root, width=30)
+    entry.grid(row=i, column=1)
+    fields[key] = entry
+
+tk.Label(root, text="Chat IDs (по одному на строку):").grid(row=3, column=0, columnspan=2)
+chat_ids_text = scrolledtext.ScrolledText(root, width=50, height=4)
+chat_ids_text.grid(row=4, column=0, columnspan=2)
+
+tk.Label(root, text="Ключевые слова (JSON):").grid(row=5, column=0, columnspan=1)
+keywords_text = scrolledtext.ScrolledText(root, width=50, height=8)
+keywords_text.grid(row=6, column=0, columnspan=2)
+keywords_text.insert(tk.END, json.dumps({"привет": "Привет!", "как дела": "Отлично :)"}, ensure_ascii=False, indent=2))
+
+tk.Label(root, text="Лог:").grid(row=7, column=0, columnspan=2)
+log_area = scrolledtext.ScrolledText(root, width=50, height=12)
+log_area.grid(row=8, column=0, columnspan=2)
+
+def log(msg):
+    log_area.insert(tk.END, msg + "\n")
+    log_area.see(tk.END)
+
+def ask_from_main_thread(title, prompt, is_password=False):
+    q = Queue()
+
+    def ask():
+        result = simpledialog.askstring(title, prompt, show="*" if is_password else "")
+        q.put(result)
+
+    root.after(0, ask)
+    return q.get()
+
+def start_bot():
+    global running, client, bot_loop_thread, loop
+    if running:
+        log("⚠️ Бот уже запущен")
+        return
+    try:
+        phone = fields['phone'].get().strip()
+        api_id = int(fields['api_id'].get().strip())
+        api_hash = fields['api_hash'].get().strip()
+        chat_ids_raw = chat_ids_text.get("1.0", tk.END).strip().splitlines()
+        chat_ids = [int(line.strip()) for line in chat_ids_raw if line.strip()]
+        keywords = json.loads(keywords_text.get("1.0", tk.END))
+    except Exception as e:
+        messagebox.showerror("Ошибка", str(e))
+        return
+
+    def run_bot(phone, api_id, api_hash, chat_ids, keywords):
+        global client, loop, running
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        session_name = f"anon_{phone.replace('+', '')}"
+        client = TelegramClient(session_name, api_id, api_hash)
+
+        async def main():
+            await client.connect()
+
+            if not await client.is_user_authorized():
+                log("🔐 Авторизация...")
+                await client.send_code_request(phone)
+                code = ask_from_main_thread("Telegram", "Введите код из Telegram:")
+                try:
+                    await client.sign_in(phone, code)
+                except SessionPasswordNeededError:
+                    pw = ask_from_main_thread("Telegram", "Введите пароль (2FA):", is_password=1)
+                    try:
+                        await client.sign_in(password=pw)
+                    except Exception as e:
+                        log(f"❌ Ошибка авторизации: {e}")
+                        return
+
+            @client.on(events.NewMessage(incoming=True))
+            async def handler(event):
+                if event.chat_id not in chat_ids:
+                    return
+                msg = event.raw_text.lower()
+                log(f"📨 {event.chat_id}: {msg}")
+                for keyword, reply in keywords.items():
+                    if keyword in msg:
+                        await event.reply(reply)
+                        log(f"✅ Ответ: {reply}")
+                        break
+
+            log("🤖 Бот запущен")
+            await asyncio.Event().wait()
+
+        try:
+            loop.run_until_complete(main())
+        finally:
+            loop.close()
+
+    bot_loop_thread = threading.Thread(target=run_bot, args=(phone, api_id, api_hash, chat_ids, keywords), daemon=True)
+    bot_loop_thread.start()
+    running = True
+    log("▶️ Старт бота")
+
+def stop_bot():
+    global client, running, loop, bot_loop_thread
+    if not running:
+        log("⚠️ Бот не запущен")
+        return
+
+    def stop_async():
+        global client, running, loop
+        if client is None or loop is None or loop.is_closed():
+            log("⚠️ Нет активного loop для остановки")
+            return
+        def disconnect_coro():
+            async def disconnect():
+                global running, client
+                try:
+                    await client.disconnect()
+                    log("⛔ Бот остановлен")
+                except Exception as e:
+                    log(f"❌ Ошибка при остановке: {e}")
+                finally:
+                    running=0
+                    client=None
+            asyncio.ensure_future(disconnect(), loop=loop)
+        loop.call_soon_threadsafe(disconnect_coro)
+
+    threading.Thread(target=stop_async, daemon=True).start()
+
+async def fetch_chats(phone, api_id, api_hash):
+    session_name = f"get_chats_{phone.replace('+', '')}"
+    temp_client = TelegramClient(session_name, api_id, api_hash)
+    await temp_client.connect()
+    if not await temp_client.is_user_authorized():
+        await temp_client.send_code_request(phone)
+        code = ask_from_main_thread("Telegram", "Введите код:")
+        try:
+            await temp_client.sign_in(phone, code)
+        except SessionPasswordNeededError:
+            pw = ask_from_main_thread("Telegram", "Введите пароль:", is_password=True)
+            await temp_client.sign_in(password=pw)
+
+    top = tk.Toplevel(root)
+    top.title("Список чатов")
+    txt = scrolledtext.ScrolledText(top, width=60, height=25)
+    txt.pack(padx=10, pady=10)
+
+    async for dialog in temp_client.iter_dialogs():
+        entity = dialog.entity
+        if isinstance(entity, Channel):
+            typ = "Супергруппа" if getattr(entity, 'megagroup', False) else "Канал"
+            id_str = f"-100{entity.id}"
+            txt.insert(tk.END, f"{typ}: {dialog.name} — ID: {id_str}\n")
+        elif isinstance(entity, Chat):
+            txt.insert(tk.END, f"Группа: {dialog.name} — ID: {entity.id}\n")
+        elif isinstance(entity, User):
+            name = f"{entity.first_name or ''} {entity.last_name or ''}".strip() or entity.username or "Без имени"
+            username_part = f"(@{entity.username})" if entity.username else ""
+            txt.insert(tk.END, f"Личка: {name} {username_part} — ID: {entity.id}\n")
+
+    await temp_client.disconnect()
+
+def show_chats():
+    try:
+        phone = fields['phone'].get().strip()
+        api_id = int(fields['api_id'].get().strip())
+        api_hash = fields['api_hash'].get().strip()
+    except Exception as e:
+        messagebox.showerror("Ошибка", str(e))
+        return
+
+    def run_fetch():
+        asyncio.run(fetch_chats(phone, api_id, api_hash))
+
+    threading.Thread(target=run_fetch, daemon=True).start()
+
+tk.Button(root, text="▶️ Запуск", command=start_bot).grid(row=9, column=0, pady=5)
+tk.Button(root, text="⛔ Остановить", command=stop_bot).grid(row=9, column=1, pady=5)
+tk.Button(root, text="📋 Показать чаты", command=show_chats).grid(row=10, column=0, columnspan=2, pady=(0, 10))
+
+root.mainloop()
